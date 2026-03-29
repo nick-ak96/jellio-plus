@@ -79,7 +79,7 @@ public class AddonController : ControllerBase
             return overrideBaseUrl!.TrimEnd('/');
         }
 
-        return $"{Request.Scheme}://{Request.Host}{Request.PathBase}";
+        return $"https://{Request.Host}{Request.PathBase}";
     }
 
     private static MetaDto MapToMeta(
