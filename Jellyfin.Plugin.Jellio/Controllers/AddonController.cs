@@ -30,19 +30,20 @@ public class AddonController : ControllerBase
     private readonly IUserViewManager _userViewManager;
     private readonly IDtoService _dtoService;
     private readonly ILibraryManager _libraryManager;
-    private static readonly HttpClient _httpClient = new();
+    private readonly IHttpClientFactory _httpClientFactory;
 
     public AddonController(
         IUserManager userManager,
         IUserViewManager userViewManager,
         IDtoService dtoService,
-        ILibraryManager libraryManager
-    )
+        ILibraryManager libraryManager,
+        IHttpClientFactory httpClientFactory)
     {
         _userManager = userManager;
         _userViewManager = userViewManager;
         _dtoService = dtoService;
         _libraryManager = libraryManager;
+        _httpClientFactory = httpClientFactory;
     }
 
     private async Task<string?> GetTitleFromCinemeta(string imdbId, string type)
@@ -50,10 +51,12 @@ public class AddonController : ControllerBase
         try
         {
             var stremioType = type == "movie" ? "movie" : "series";
-            var response = await _httpClient.GetAsync($"https://v3-cinemeta.strem.io/meta/{stremioType}/tt{imdbId}.json");
+            using var httpClient = _httpClientFactory.CreateClient();
+            using var response = await httpClient.GetAsync($"https://v3-cinemeta.strem.io/meta/{stremioType}/tt{imdbId}.json").ConfigureAwait(false);
             if (response.IsSuccessStatusCode)
             {
-                using var doc = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+                using var responseStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                using var doc = await JsonDocument.ParseAsync(responseStream).ConfigureAwait(false);
                 if (doc.RootElement.TryGetProperty("meta", out var meta) &&
                     meta.TryGetProperty("name", out var name))
                 {
@@ -153,32 +156,59 @@ public class AddonController : ControllerBase
         var dtos = _dtoService.GetBaseItemDtos(items, dtoOptions, user);
         LogBuffer.AddLog($"[Stream] Got {dtos.Count} DTO(s)", LogLevel.Info);
 
-        var streams = dtos.SelectMany(dto =>
+        var streams = new List<StreamDto>();
+
+        for (int i = 0; i < items.Count; i++)
         {
-            int mediaSourceCount = 0;
-            if (dto.MediaSources != null)
-            {
-                mediaSourceCount = dto.MediaSources.Count();
-            }
+            var item = items[i];
+            var dto = dtos[i];
 
-            LogBuffer.AddLog($"[Stream] Processing DTO: {dto.Name} (Id: {dto.Id}, MediaSources: {mediaSourceCount})", LogLevel.Info);
-            if (dto.MediaSources == null)
+            foreach (var source in dto.MediaSources)
             {
-                return Enumerable.Empty<StreamDto>();
-            }
-
-            return dto.MediaSources.Select(source =>
-            {
-                var streamUrl = $"{baseUrl}/videos/{dto.Id}/stream?mediaSourceId={source.Id}&api_key={Uri.EscapeDataString(authToken)}&AudioCodec=aac&TranscodingMaxAudioChannels=2&CopyTimestamps=true";
-                LogBuffer.AddLog($"[Stream] Generated stream for {dto.Name} ({dto.Id}): {source.Name} - URL: {streamUrl}", LogLevel.Info);
-                return new StreamDto
+                // extract subtitles
+                List<SubtitleDto>? subtitles = null;
+                if (source.MediaStreams != null)
                 {
-                    Url = streamUrl,
+                    var subStreams = source.MediaStreams
+                        .Where(s => s.Type == MediaStreamType.Subtitle && s.IsTextSubtitleStream)
+                        .ToList();
+                    if (subStreams.Count > 0)
+                    {
+                        subtitles = [.. subStreams.Select(s => new SubtitleDto
+                        {
+                            Url = $"{baseUrl}/Videos/{dto.Id}/{source.Id}/Subtitles/{s.Index}/0/Stream.srt?api_key={Uri.EscapeDataString(authToken)}",
+                            Lang = s.Language ?? "und",
+                            Id = $"{s.Index}-{s.Language ?? "und"}-{s.DisplayTitle ?? "Subtitle"}",
+                        })];
+                        LogBuffer.AddLog($"[Stream] Found {subtitles.Count} text subtitle(s) for {dto.Name}", LogLevel.Info);
+                    }
+                }
+
+                streams.Add(new StreamDto
+                {
+                    Url = $"{baseUrl}/videos/{dto.Id}/stream?mediaSourceId={source.Id}&static=true&copyTimestamps=true&api_key={authToken}",
                     Name = "Jellio",
                     Description = source.Name,
-                };
-            });
-        }).ToList();
+                    Subtitles = subtitles,
+                    BehaviorHints = new BehaviorHints
+                    {
+                        NotWebReady = true
+                    }
+                });
+
+                streams.Add(new StreamDto
+                {
+                    Url = $"{baseUrl}/Items/{dto.Id}/Download?mediaSourceId={source.Id}&api_key={authToken}",
+                    Name = "Jellio (Direct)",
+                    Description = $"{source.Name} - Direct Download",
+                    Subtitles = subtitles,
+                    BehaviorHints = new BehaviorHints
+                    {
+                        NotWebReady = true
+                    }
+                });
+            }
+        }
 
         LogBuffer.AddLog($"[Stream] Returning {streams.Count} stream(s)", LogLevel.Info);
         return Ok(new { streams });
@@ -187,6 +217,8 @@ public class AddonController : ControllerBase
     [HttpGet("manifest.json")]
     public IActionResult GetManifest([ConfigFromBase64Json] ConfigModel config)
     {
+        ArgumentNullException.ThrowIfNull(config);
+
         var userId = (Guid)HttpContext.Items["JellioUserId"]!;
 
         var userLibraries = LibraryHelper.GetUserLibraries(userId, _userManager, _userViewManager, _dtoService);
@@ -214,10 +246,13 @@ public class AddonController : ControllerBase
                     new { name = "search", isRequired = false },
                 },
             };
-        });
+        }).ToArray();
 
-        var catalogNames = userLibraries.Select(l => l.Name).ToList();
-        var descriptionText = $"Play movies and series from {config.ServerName}: {string.Join(", ", catalogNames)}";
+        // Description based on whether catalogs are present
+        var descriptionText = catalogs.Length > 0
+            ? $"Play movies and series from {config.ServerName}: {string.Join(", ", userLibraries.Select(l => l.Name))}"
+            : $"Search and play movies and series from {config.ServerName}";
+
         var manifest = new
         {
             id = "com.stremio.jellio",
@@ -297,7 +332,7 @@ public class AddonController : ControllerBase
 
         var query = new InternalItemsQuery(user)
         {
-            Recursive = true, // need this for search to work
+            Recursive = true,
             IncludeItemTypes = [BaseItemKind.Movie, BaseItemKind.Series],
             Limit = 100,
             StartIndex = startIndex,
@@ -307,7 +342,7 @@ public class AddonController : ControllerBase
         };
         var result = folder.GetItems(query);
         var dtos = _dtoService.GetBaseItemDtos(result.Items, dtoOptions, user);
-    var baseUrl = GetBaseUrl();
+        var baseUrl = GetBaseUrl();
         var metas = dtos.Select(dto => MapToMeta(dto, stremioType, baseUrl));
 
         return Ok(new { metas });
@@ -376,6 +411,8 @@ public class AddonController : ControllerBase
         Guid mediaId
     )
     {
+        ArgumentNullException.ThrowIfNull(config);
+
         var userId = (Guid)HttpContext.Items["JellioUserId"]!;
         LogBuffer.AddLog($"[Stream] Stream request for {stremioType} with ID: {mediaId}", LogLevel.Info);
 
@@ -400,6 +437,8 @@ public class AddonController : ControllerBase
         string imdbId
     )
     {
+        ArgumentNullException.ThrowIfNull(config);
+
         var userId = (Guid)HttpContext.Items["JellioUserId"]!;
 
         var user = _userManager.GetUserById(userId);
@@ -420,7 +459,7 @@ public class AddonController : ControllerBase
             // No local stream found; provide a Jellyseerr request stream if configured
             if (config.JellyseerrEnabled && !string.IsNullOrWhiteSpace(config.JellyseerrUrl))
             {
-                var title = await GetTitleFromCinemeta(imdbId, "movie");
+                var title = await GetTitleFromCinemeta(imdbId, "movie").ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(title))
                 {
                     var baseUrl = GetBaseUrl(config.PublicBaseUrl);
@@ -447,6 +486,8 @@ public class AddonController : ControllerBase
         int episodeNum
     )
     {
+        ArgumentNullException.ThrowIfNull(config);
+
         var userId = (Guid)HttpContext.Items["JellioUserId"]!;
         LogBuffer.AddLog($"[Stream] TV Episode request: IMDB={imdbId}, Season={seasonNum}, Episode={episodeNum}", LogLevel.Info);
 
@@ -471,7 +512,7 @@ public class AddonController : ControllerBase
             // Series not found - show Jellyseerr option if enabled
             if (config.JellyseerrEnabled && !string.IsNullOrWhiteSpace(config.JellyseerrUrl))
             {
-                var title = await GetTitleFromCinemeta(imdbId, "tv");
+                var title = await GetTitleFromCinemeta(imdbId, "tv").ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(title))
                 {
                     var baseUrl = GetBaseUrl(config.PublicBaseUrl);
@@ -506,7 +547,7 @@ public class AddonController : ControllerBase
             // Episode not found - show Jellyseerr option if enabled
             if (config.JellyseerrEnabled && !string.IsNullOrWhiteSpace(config.JellyseerrUrl))
             {
-                var title = await GetTitleFromCinemeta(imdbId, "tv");
+                var title = await GetTitleFromCinemeta(imdbId, "tv").ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(title))
                 {
                     var baseUrl = GetBaseUrl(config.PublicBaseUrl);

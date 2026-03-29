@@ -1,15 +1,12 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.Http.Json;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Jellio.Helpers;
 using Jellyfin.Plugin.Jellio.Models;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.WebUtilities;
 
 namespace Jellyfin.Plugin.Jellio.Controllers;
 
@@ -141,12 +138,13 @@ public class RequestController : ControllerBase
 
                 Console.WriteLine($"[Jellyseerr] Searching Jellyseerr for title: {title}");
                 var searchUri = $"api/v1/search?query={Uri.EscapeDataString(title!)}";
-                using var resp = await client.GetAsync(searchUri);
+                using var resp = await client.GetAsync(searchUri).ConfigureAwait(false);
                 Console.WriteLine($"[Jellyseerr] Search response status: {resp.StatusCode}");
 
                 if (resp.IsSuccessStatusCode)
                 {
-                    using var doc = JsonDocument.Parse(await resp.Content.ReadAsStreamAsync());
+                    using var responseStream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                    using var doc = await JsonDocument.ParseAsync(responseStream).ConfigureAwait(false);
                     if (doc.RootElement.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
                     {
                         Console.WriteLine($"[Jellyseerr] Found {results.GetArrayLength()} search results");
@@ -167,7 +165,7 @@ public class RequestController : ControllerBase
                 }
                 else
                 {
-                    var errorContent = await resp.Content.ReadAsStringAsync();
+                    var errorContent = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                     Console.WriteLine($"[Jellyseerr] Search failed: {errorContent}");
                 }
             }
@@ -212,7 +210,7 @@ public class RequestController : ControllerBase
             }
 
             Console.WriteLine($"[Jellyseerr] Sending request to Jellyseerr: {config.JellyseerrUrl}/api/v1/request");
-            using var createResp = await client.PostAsJsonAsync("api/v1/request", body);
+            using var createResp = await client.PostAsJsonAsync("api/v1/request", body).ConfigureAwait(false);
             Console.WriteLine($"[Jellyseerr] Request response status: {createResp.StatusCode}");
 
             if (createResp.IsSuccessStatusCode)
@@ -226,7 +224,7 @@ public class RequestController : ControllerBase
                 return Content("✓ Content request sent to Jellyseerr successfully!", "text/plain");
             }
 
-            var failContent = await createResp.Content.ReadAsStringAsync();
+            var failContent = await createResp.Content.ReadAsStringAsync().ConfigureAwait(false);
             Console.WriteLine($"[Jellyseerr] ERROR: Request failed with: {failContent}");
             return Problem($"Jellyseerr request failed with status {(int)createResp.StatusCode}.", statusCode: 502);
         }
